@@ -58,6 +58,13 @@ pub enum Error {
     InvalidAmount = 10,
     UnauthorizedFunction = 11,
     MalformedAuthContext = 12,
+    InvalidCap = 13,
+}
+
+fn validate_cap(env: &Env, cap: i128) {
+    if cap < 0 {
+        panic_with_error!(env, Error::InvalidCap);
+    }
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -100,6 +107,10 @@ impl AgentVault {
             }
         }
 
+        validate_cap(&env, daily_cap);
+        for (_, sub_cap) in allowlist.iter() {
+            validate_cap(&env, sub_cap);
+        }
         storage.set(&ADMIN_KEY, &admin);
         storage.set(&AGENT_KEY, &agent_pk);
         storage.set(&CAP_KEY, &daily_cap);
@@ -122,6 +133,7 @@ impl AgentVault {
         if new_cap < 0 {
             panic_with_error!(&env, Error::InvalidAmount);
         }
+        validate_cap(&env, new_cap);
         let old_cap: i128 = storage.get(&CAP_KEY).unwrap_or(0);
         storage.set(&CAP_KEY, &new_cap);
         env.events().publish(
@@ -140,6 +152,7 @@ impl AgentVault {
         if sub_cap < 0 {
             panic_with_error!(&env, Error::InvalidAmount);
         }
+        validate_cap(&env, sub_cap);
         let mut map: Map<Address, i128> = storage
             .get(&LIST_KEY)
             .unwrap_or_else(|| Map::new(&env));
@@ -2646,6 +2659,85 @@ mod tests {
             .is_ok(),
             "raising the lifetime cap should let the transfer through"
         );
+    }
+
+    #[test]
+    fn test_initialize_negative_daily_cap_rejected() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let allowlist = Map::new(&env);
+
+        let result = client.try_initialize(&admin, &agent_pk, &-1_i128, &allowlist, &10_000_u32, &0_i128);
+        assert_eq!(result.unwrap_err().unwrap(), Error::InvalidCap.into());
+
+        // Contract remains uninitialized — second initialize with valid args succeeds
+        let result2 = client.try_initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        assert!(result2.is_ok());
+    }
+
+    #[test]
+    fn test_initialize_negative_allowlist_sub_cap_rejected() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let payee = Address::generate(&env);
+        let allowlist = Map::from_array(&env, [(payee, -100_i128)]);
+
+        let result = client.try_initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        assert_eq!(result.unwrap_err().unwrap(), Error::InvalidCap.into());
+    }
+
+    #[test]
+    fn test_set_daily_cap_negative_rejected_and_stored_cap_unchanged() {
+        let env = Env::default();
+        let (client, _, vault_id, _) = setup(&env);
+
+        // Re-read initial cap
+        let initial_cap = env.as_contract(&vault_id, || {
+            env.storage().instance().get(&CAP_KEY).unwrap_or(0_i128)
+        });
+        assert_eq!(initial_cap, 5_000_000_i128);
+
+        env.mock_all_auths();
+        let result = client.try_set_daily_cap(&-1_i128);
+        assert_eq!(result.unwrap_err().unwrap(), Error::InvalidCap.into());
+
+        // Stored cap unchanged
+        let after_cap = env.as_contract(&vault_id, || {
+            env.storage().instance().get(&CAP_KEY).unwrap_or(0_i128)
+        });
+        assert_eq!(after_cap, 5_000_000_i128);
+
+        // Zero cap succeeds
+        assert!(client.try_set_daily_cap(&0_i128).is_ok());
+    }
+
+    #[test]
+    fn test_add_to_allowlist_negative_rejected_and_not_added() {
+        let env = Env::default();
+        let (client, _, vault_id, _) = setup(&env);
+        let new_payee = Address::generate(&env);
+
+        env.mock_all_auths();
+        let result = client.try_add_to_allowlist(&new_payee, &-1_i128);
+        assert_eq!(result.unwrap_err().unwrap(), Error::InvalidCap.into());
+
+        // Payee was not added to allowlist
+        let in_allowlist = env.as_contract(&vault_id, || {
+            let map: Map<Address, i128> = env.storage().instance().get(&LIST_KEY).unwrap();
+            map.contains_key(new_payee.clone())
+        });
+        assert!(!in_allowlist);
+
+        // Zero cap succeeds
+        assert!(client.try_add_to_allowlist(&new_payee, &0_i128).is_ok());
     }
 }
 
